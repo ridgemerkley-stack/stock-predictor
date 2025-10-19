@@ -10,14 +10,12 @@ from sklearn.ensemble import RandomForestClassifier
 from ta.trend import EMAIndicator, MACD
 from ta.momentum import RSIIndicator
 from ta.volatility import AverageTrueRange
-import streamlit as st
-from streamlit_aggrid import AgGrid, GridUpdateMode
+from flask import Flask, render_template, request
 import time
 
-# Curated list of AI-recommended stocks (based on free data trends)
-AI_STOCKS = ['NVDA', 'AVGO', 'TSM', 'AMD', 'TTD', 'LMND', 'ASML', 'GOOGL', 'AMZN', 'MSFT', 'ORCL', 'CRWV', 'NBIS', 'SOUN']
+app = Flask(__name__)
 
-# Continuous Training Transformer Model
+# Transformer Model
 class TransformerModel(nn.Module):
     def __init__(self, input_dim, d_model, nhead, num_layers):
         super().__init__()
@@ -27,21 +25,10 @@ class TransformerModel(nn.Module):
 
     def forward(self, src):
         src = self.embedding(src)
-        src = src.permute(1, 0, -1)  # (seq_len, batch, d_model)
+        src = src.permute(1, 0, -1)
         output = self.transformer(src)
-        return self.fc(output[-1])  # Last time step
+        return self.fc(output[-1])
 
-# Fetch and update data
-def fetch_stocks_data(stocks, period='1y'):
-    data = {}
-    for stock in stocks:
-        ticker = yf.Ticker(stock)
-        hist = ticker.history(period=period)
-        if not hist.empty:
-            data[stock] = hist
-    return data
-
-# Create sequences with sliding window
 def create_sequences(data, seq_length=60):
     X, y = [], []
     for i in range(len(data) - seq_length):
@@ -49,7 +36,6 @@ def create_sequences(data, seq_length=60):
         y.append(data[i+seq_length])
     return np.array(X), np.array(y)
 
-# Continuously train Transformer
 def train_model(data_scaled, seq_length=60):
     X, y = create_sequences(data_scaled, seq_length)
     X = torch.from_numpy(X).float()
@@ -58,21 +44,14 @@ def train_model(data_scaled, seq_length=60):
     model = TransformerModel(input_dim=1, d_model=64, nhead=4, num_layers=2)
     criterion = nn.MSELoss()
     optimizer = optim.Adam(model.parameters(), lr=0.001)
-    for epoch in range(5):  # Fewer epochs for speed in continuous training
+    for epoch in range(5):
         optimizer.zero_grad()
         output = model(X_train)
         loss = criterion(output, y_train)
         loss.backward()
         optimizer.step()
-        # Validate and adjust
-        with torch.no_grad():
-            val_output = model(X_val)
-            val_loss = criterion(val_output, y_val)
-            if val_loss.item() > loss.item():  # Early stopping if validation worsens
-                break
     return model
 
-# Predict future with continuous model
 def predict_future(model, data_scaled, scaler, seq_length=60, future_days=30):
     last_sequence = torch.from_numpy(data_scaled[-seq_length:]).float().unsqueeze(0)
     predictions = []
@@ -82,7 +61,6 @@ def predict_future(model, data_scaled, scaler, seq_length=60, future_days=30):
         last_sequence = torch.cat((last_sequence[:, 1:], pred.unsqueeze(0)), dim=1)
     return scaler.inverse_transform(np.array(predictions).reshape(-1, 1))
 
-# Generate indicators
 def generate_indicators(df):
     if df.empty:
         return pd.DataFrame()
@@ -97,8 +75,6 @@ def generate_indicators(df):
     df['ATR'] = atr
     return df.dropna()
 
-# Train classifier with continuous feedback
-@st.cache_data(ttl=300)  # Refresh every 5 minutes
 def train_signal_classifier(df_samples):
     features = ['RSI', 'MACD', 'Price_Change', 'EMA_Crossover', 'Volatility']
     X = pd.concat([df[features] for df in df_samples.values() if not df.empty]).dropna()
@@ -108,7 +84,6 @@ def train_signal_classifier(df_samples):
     clf.fit(X_train, y_train)
     return clf
 
-# Get signal and buy score
 def get_stock_signal(df, clf, sentiment_score=0.5):
     if df.empty:
         return 'Hold', 50, 'N/A'
@@ -123,20 +98,76 @@ def get_stock_signal(df, clf, sentiment_score=0.5):
     buy_score = confidence if current_signal == 1 else (100 - confidence)
     return signal_map[current_signal], buy_score, confidence
 
-# Main UI
-st.set_page_config(page_title="AI Stock Scanner", layout="wide")
-st.title("🌐 AI Stock Scanner with Continuous Training")
+def fetch_stocks_data(stocks):
+    data = {}
+    for stock in stocks:
+        ticker = yf.Ticker(stock)
+        hist = ticker.history(period='1y')
+        if not hist.empty:
+            data[stock] = hist
+    return data
 
-# Sidebar for filters
-st.sidebar.header("Filters")
-selected_stocks = st.sidebar.multiselect("Select Stocks", AI_STOCKS, default=AI_STOCKS[:5])
-sentiment = st.sidebar.slider("Sentiment Score (0-1)", 0.0, 1.0, 0.5)
-min_buy_score = st.sidebar.slider("Min Buy Score", 0, 100, 70)
-refresh_interval = st.sidebar.slider("Refresh Interval (min)", 1, 15, 5)
+# HTML Template
+html_template = """
+<!DOCTYPE html>
+<html>
+<head>
+    <title>AI Stock Scanner</title>
+    <style>
+        body { font-family: Arial, sans-serif; margin: 20px; }
+        .filter { margin-bottom: 15px; }
+        table { width: 100%; border-collapse: collapse; }
+        th, td { border: 1px solid #ddd; padding: 8px; text-align: left; }
+        th { background-color: #f2f2f2; }
+        .chart { margin-top: 20px; }
+    </style>
+</head>
+<body>
+    <h1>AI Stock Scanner with Continuous Training</h1>
+    <div class="filter">
+        <label for="stocks">Enter Stock Tickers (comma-separated, e.g., AAPL, MSFT):</label><br>
+        <textarea id="stocks" name="stocks" rows="2" cols="50">{{ stocks_input }}</textarea><br>
+        <label for="sentiment">Sentiment Score (0-1):</label>
+        <input type="range" id="sentiment" name="sentiment" min="0.0" max="1.0" step="0.1" value="{{ sentiment }}" oninput="this.nextElementSibling.value=this.value">
+        <output>{{ sentiment }}</output><br>
+        <label for="min_buy">Min Buy Score:</label>
+        <input type="range" id="min_buy" name="min_buy" min="0" max="100" step="1" value="{{ min_buy }}" oninput="this.nextElementSibling.value=this.value">
+        <output>{{ min_buy }}</output><br>
+        <button onclick="scanStocks()">Scan Stocks Now</button>
+        <button onclick="autoRefresh()">Auto-Refresh (5 Min)</button>
+    </div>
+    <div id="results">{{ results|safe }}</div>
+    <div class="chart" id="chart">{{ chart|safe }}</div>
+    <script>
+        function scanStocks() {
+            var stocks = document.getElementById('stocks').value;
+            var sentiment = document.getElementById('sentiment').value;
+            var min_buy = document.getElementById('min_buy').value;
+            window.location.href = '/scan?stocks=' + encodeURIComponent(stocks) + '&sentiment=' + sentiment + '&min_buy=' + min_buy;
+        }
+        function autoRefresh() {
+            setInterval(scanStocks, 300000); // 5 minutes
+        }
+    </script>
+</body>
+</html>
+"""
 
-# Fetch and process data
-if st.button("Scan Stocks Now"):
-    with st.spinner(f"Analyzing stocks with continuous AI training ({time.ctime()})..."):
+@app.route('/')
+def index():
+    return render_template_string(html_template, stocks_input="", sentiment=0.5, min_buy=70)
+
+@app.route('/scan')
+def scan_stocks():
+    stocks_input = request.args.get('stocks', '')
+    selected_stocks = [s.strip() for s in stocks_input.split(',') if s.strip()]
+    sentiment = float(request.args.get('sentiment', 0.5))
+    min_buy = float(request.args.get('min_buy', 70))
+
+    if not selected_stocks:
+        return render_template_string(html_template, stocks_input=stocks_input, sentiment=sentiment, min_buy=min_buy, results="No stocks entered.", chart="")
+
+    with st.spinner("Analyzing stocks with continuous AI training..."):
         data = fetch_stocks_data(selected_stocks)
         df_samples = {stock: generate_indicators(df) for stock, df in data.items()}
         clf = train_signal_classifier(df_samples)
@@ -144,10 +175,10 @@ if st.button("Scan Stocks Now"):
         for stock, df in df_samples.items():
             if not df.empty:
                 data_scaled = MinMaxScaler().fit_transform(df['Close'].values.reshape(-1, 1))
-                model = train_model(data_scaled)  # Continuous training on latest data
+                model = train_model(data_scaled)
                 predictions = predict_future(model, data_scaled, MinMaxScaler().fit(data_scaled), future_days=30)
                 signal, buy_score, confidence = get_stock_signal(df, clf, sentiment)
-                if buy_score >= min_buy_score and signal == "Buy":
+                if buy_score >= min_buy and signal == "Buy":
                     results.append({
                         'Stock': stock,
                         'Current Price': f"${df['Close'].iloc[-1]:.2f}",
@@ -158,25 +189,14 @@ if st.button("Scan Stocks Now"):
                         'Change (1D)': f"{df['Price_Change'].iloc[-1]*100:.2f}%"
                     })
         results_df = pd.DataFrame(results).sort_values('Buy Score', ascending=False)
-        
-        if not results_df.empty:
-            st.success(f"📈 {len(results_df)} Stocks Recommended to Buy!")
-            grid_response = AgGrid(results_df, height=400, fit_columns_on_grid_load=True, update_mode=GridUpdateMode.MODEL_CHANGED)
-            st.write("Click a row for a quick chart:")
-            selected = grid_response['selected_rows']
-            if selected:
-                stock = selected[0]['Stock']
-                st.line_chart(data[stock]['Close'].tail(30))
-        else:
-            st.info("No stocks meet the criteria. Adjust filters or wait for data refresh.")
 
-# Auto-refresh with continuous training
-if st.button(f"Auto-Refresh (Every {refresh_interval} Min)"):
-    st.rerun()
-    time.sleep(refresh_interval * 60)  # Simulate continuous update
+        if results_df.empty:
+            return render_template_string(html_template, stocks_input=stocks_input, sentiment=sentiment, min_buy=min_buy, results="No stocks meet the criteria.", chart="")
 
-# Footer
-st.markdown("---")
-st.caption("Powered by free yfinance data. AI continuously trains on latest trends. Not financial advice.")
+        table_html = results_df.to_html(index=False, classes='table table-striped')
+        chart_html = "<div>No chart available</div>"  # Simplified; add Plotly if desired
+        return render_template_string(html_template, stocks_input=stocks_input, sentiment=sentiment, min_buy=min_buy, results=table_html, chart=chart_html)
 
-# Run with: py -m streamlit run app.py
+if __name__ == '__main__':
+    app.run(debug=True)
+    
